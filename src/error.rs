@@ -179,6 +179,8 @@ pub enum Item {
     Group,
     /// A SDO sub-index.
     SdoSubIndex,
+    /// An unsolicited mailbox queue or message.
+    UnsolicitedMailbox,
 }
 
 /// Low-level PDU (Process Data Unit) error.

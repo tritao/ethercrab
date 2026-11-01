@@ -356,22 +356,28 @@ impl core::fmt::Display for ObjectDescriptionListQuery {
 pub trait CoeServiceRequest:
     ethercrab_wire::EtherCrabWireReadWrite + ethercrab_wire::EtherCrabWireWriteSized
 {
+    /// Byte offset of response data after the mailbox and service headers.
+    const RESPONSE_DATA_OFFSET: usize;
+
     fn validate_response(&self, received_index: u16, received_subindex: u8) -> bool;
 }
 
 impl CoeServiceRequest for SdoExpedited {
+    const RESPONSE_DATA_OFFSET: usize = 12;
     fn validate_response(&self, received_index: u16, received_subindex: u8) -> bool {
         received_index == self.sdo_header.index && received_subindex == self.sdo_header.sub_index
     }
 }
 
 impl CoeServiceRequest for SdoNormal {
+    const RESPONSE_DATA_OFFSET: usize = 12;
     fn validate_response(&self, received_index: u16, received_subindex: u8) -> bool {
         received_index == self.sdo_header.index && received_subindex == self.sdo_header.sub_index
     }
 }
 
 impl CoeServiceRequest for SdoSegmented {
+    const RESPONSE_DATA_OFFSET: usize = 9;
     // No values to check against, so always valid
     fn validate_response(&self, _received_index: u16, _received_subindex: u8) -> bool {
         true

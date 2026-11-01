@@ -42,6 +42,8 @@ pub struct CoeHeader {
 #[wire(bits = 3)]
 #[repr(u8)]
 pub enum CoeCommand {
+    /// Upload segment response.
+    UploadSegmentResponse = 0x00,
     Download = 0x01,
     Upload = 0x02,
     Abort = 0x04,

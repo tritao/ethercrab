@@ -39,6 +39,20 @@ pub use self::types::SubDeviceIdentity;
 pub use coe::services::{ObjectDescriptionListQuery, ObjectDescriptionListQueryCounts};
 pub use dc::DcSync;
 
+/// Maximum queued message size, including the mailbox header, in no-std builds.
+#[cfg(not(feature = "std"))]
+pub const MAX_UNSOLICITED_MAILBOX_LEN: usize = 128;
+/// Maximum queued message size, including the mailbox header, in std builds.
+#[cfg(feature = "std")]
+pub const MAX_UNSOLICITED_MAILBOX_LEN: usize = 2047;
+
+/// A complete unsolicited mailbox message, including its mailbox header.
+#[cfg(not(feature = "std"))]
+pub type UnsolicitedMailbox = heapless::Vec<u8, MAX_UNSOLICITED_MAILBOX_LEN>;
+/// A complete unsolicited mailbox message, including its mailbox header.
+#[cfg(feature = "std")]
+pub type UnsolicitedMailbox = std::vec::Vec<u8>;
+
 /// SubDevice device metadata. See [`SubDeviceRef`] for richer behaviour.
 #[doc(alias = "Slave")]
 #[derive(Debug)]
@@ -82,6 +96,9 @@ pub struct SubDevice {
 
     /// The 1-7 cyclic counter used when working with mailbox requests.
     pub(crate) mailbox_counter: AtomicU8,
+
+    pub(crate) unsolicited_mailboxes:
+        lock_api::RwLock<crate::DefaultLock, heapless::Deque<UnsolicitedMailbox, 2>>,
 
     /// DC config.
     pub(crate) dc_sync: DcSync,
@@ -131,6 +148,7 @@ impl Clone for SubDevice {
             propagation_delay: self.propagation_delay,
             dc_sync: self.dc_sync,
             mailbox_counter: AtomicU8::new(self.mailbox_counter.load(Ordering::Acquire)),
+            unsolicited_mailboxes: lock_api::RwLock::new(heapless::Deque::new()),
             oversampling_config: &[],
         }
     }
@@ -230,6 +248,7 @@ impl SubDevice {
             dc_sync: DcSync::Disabled,
             // 0 is a reserved value, so we initialise the cycle at 1. The cycle repeats 1 - 7.
             mailbox_counter: AtomicU8::new(1),
+            unsolicited_mailboxes: lock_api::RwLock::new(heapless::Deque::new()),
             oversampling_config: &[],
         })
     }
@@ -374,6 +393,15 @@ impl SubDevice {
     /// Get additional identifying details for the SubDevice.
     pub fn identity(&self) -> SubDeviceIdentity {
         self.identity
+    }
+
+    /// Remove the oldest unsolicited mailbox message saved during a CoE operation.
+    ///
+    /// The queue holds two messages, with a maximum size of 128 bytes in no-std
+    /// builds and 2047 bytes with std. Operations return a capacity error without
+    /// consuming the next message when the queue is full or the message is too large.
+    pub fn take_unsolicited_mailbox(&self) -> Option<UnsolicitedMailbox> {
+        self.unsolicited_mailboxes.write().pop_front()
     }
 
     /// Get the configured station address of the SubDevice.
@@ -527,6 +555,23 @@ impl<'maindevice, S> SubDeviceRef<'maindevice, S>
 where
     S: Deref<Target = SubDevice>,
 {
+    /// Poll once for a waiting unsolicited mailbox message without issuing an SDO.
+    ///
+    /// A received message is saved for [`SubDevice::take_unsolicited_mailbox`].
+    /// Callers must serialize this with CoE requests on the same SubDevice.
+    pub async fn poll_unsolicited_mailbox(&self) -> Result<bool, Error> {
+        Coe::new(self).poll_unsolicited().await
+    }
+
+    /// Read an ESC mailbox into caller-provided storage, including its header.
+    ///
+    /// This permits messages larger than the unsolicited queue limit to be
+    /// retrieved. An undersized buffer leaves the message in the ESC. Serialize
+    /// this operation with CoE requests and with unsolicited mailbox polling.
+    pub async fn read_pending_mailbox(&self, output: &mut [u8]) -> Result<Option<usize>, Error> {
+        Coe::new(self).read_pending_into(output).await
+    }
+
     /// Get the long name of the SubDevice.
     ///
     /// Using the EK1100 as an example, the [`name`](crate::SubDevice::name) method will return

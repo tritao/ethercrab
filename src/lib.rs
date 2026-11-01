@@ -192,14 +192,14 @@ pub use ethercrab_wire::{
     EtherCrabWireWrite, EtherCrabWireWriteSized,
 };
 use ethernet::EthernetAddress;
-pub use mailbox::coe::SubIndex;
+pub use mailbox::coe::{Emergency, SubIndex};
 pub use maindevice::MainDevice;
 pub use maindevice_config::{MainDeviceConfig, RetryBehaviour};
 pub use pdu_loop::{PduLoop, PduRx, PduStorage, PduTx, ReceiveAction, SendableFrame};
 pub use register::{DcSupport, RegisterAddress};
 pub use subdevice::{
     DcSync, ObjectDescriptionListQuery, ObjectDescriptionListQueryCounts, SubDevice,
-    SubDeviceIdentity, SubDevicePdi, SubDeviceRef,
+    SubDeviceIdentity, SubDevicePdi, SubDeviceRef, UnsolicitedMailbox,
 };
 pub use subdevice_group::{GroupId, SubDeviceGroup, SubDeviceGroupHandle, TxRxResponse};
 pub use subdevice_state::SubDeviceState;

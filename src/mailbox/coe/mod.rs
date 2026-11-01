@@ -33,6 +33,177 @@ pub(crate) use headers::{CoeCommand, CoeHeader, CoeService, SdoExpeditedPayload,
 pub use abort_code::CoeAbortCode;
 pub use headers::SubIndex;
 
+/// A CANopen emergency received through a SubDevice's CoE mailbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Emergency {
+    /// CANopen emergency error code.
+    pub error_code: u16,
+    /// CANopen error register.
+    pub error_register: u8,
+    /// Manufacturer-specific information.
+    pub data: [u8; 5],
+}
+
+impl Emergency {
+    /// Decode an emergency from a complete mailbox message, including its mailbox header.
+    pub fn from_mailbox(bytes: &[u8]) -> Option<Self> {
+        let header = MailboxHeader::unpack_from_slice(bytes).ok()?;
+        let coe = CoeHeader::unpack_from_slice(bytes.get(6..)?).ok()?;
+        if header.mailbox_type != MailboxType::Coe
+            || coe.service != CoeService::Emergency
+            || header.length < 10
+        {
+            return None;
+        }
+        let data = bytes.get(8..16)?;
+        Some(Self {
+            error_code: u16::from_le_bytes([data[0], data[1]]),
+            error_register: data[2],
+            data: data[3..8].try_into().ok()?,
+        })
+    }
+}
+
+fn save_unsolicited(subdevice: &SubDevice, response: &[u8]) -> Result<(), Error> {
+    let header = MailboxHeader::unpack_from_slice(response)?;
+    let end = usize::from(header.length) + MailboxHeader::PACKED_LEN;
+    let data = response.get(..end).ok_or(Error::Pdu(PduError::Decode))?;
+    #[cfg(not(feature = "std"))]
+    let message = crate::subdevice::UnsolicitedMailbox::from_slice(data)
+        .map_err(|_| Error::Capacity(Item::UnsolicitedMailbox))?;
+    #[cfg(feature = "std")]
+    let message = data.to_vec();
+    subdevice
+        .unsolicited_mailboxes
+        .write()
+        .push_back(message)
+        .map_err(|_| Error::Capacity(Item::UnsolicitedMailbox))
+}
+
+// Return true only for a response to be processed by the SDO transaction.
+fn route_sdo_response(subdevice: &SubDevice, response: &[u8]) -> Result<bool, Error> {
+    let is_sdo_response = response.get(5).is_some_and(|b| b & 0x0f == 3)
+        && response.get(7).is_some_and(|b| b >> 4 == 3);
+    if !is_sdo_response {
+        save_unsolicited(subdevice, response)?;
+    }
+    Ok(is_sdo_response)
+}
+
+fn append_upload_segment(
+    buf: &mut [u8],
+    total_len: &mut usize,
+    headers: &SdoSegmented,
+    data: &[u8],
+) -> Result<(), Error> {
+    let mut chunk_len = usize::from(
+        headers
+            .header
+            .length
+            .checked_sub(3)
+            .ok_or(Error::Internal)?,
+    );
+    // The minimum segment data field is seven bytes; the command says how
+    // many bytes of that field are padding on the last, short segment.
+    if chunk_len == 7 {
+        chunk_len = chunk_len
+            .checked_sub(usize::from(headers.sdo_header.segment_data_size))
+            .ok_or(Error::Internal)?;
+    }
+    let end = total_len.checked_add(chunk_len).ok_or(Error::Internal)?;
+    let source = data.get(..chunk_len).ok_or(Error::Internal)?;
+    buf.get_mut(*total_len..end)
+        .ok_or(Error::Internal)?
+        .copy_from_slice(source);
+    *total_len = end;
+    Ok(())
+}
+
+#[cfg(test)]
+mod emergency_tests {
+    use super::*;
+
+    #[test]
+    fn emergency_uses_coe_payload_offset_and_keeps_manufacturer_data() {
+        let frame = [10, 0, 0, 0, 0, 3, 0, 0x10, 0x10, 0x32, 4, 1, 2, 3, 4, 5];
+        assert_eq!(
+            Emergency::from_mailbox(&frame),
+            Some(Emergency {
+                error_code: 0x3210,
+                error_register: 4,
+                data: [1, 2, 3, 4, 5],
+            })
+        );
+        assert_eq!(Emergency::from_mailbox(&frame[..15]), None);
+    }
+
+    #[test]
+    fn upload_segment_response_has_a_nine_byte_header() {
+        // A last segment with four bytes and three unused bytes.
+        let frame = [10, 0, 0, 0, 0, 0x13, 0, 0x30, 0x07, 0x92, 1, 2, 0, 0, 0, 0];
+        let header = SdoSegmented::unpack_from_slice(&frame).unwrap();
+        assert_eq!(header.sdo_header.command, CoeCommand::UploadSegmentResponse);
+        assert!(header.sdo_header.is_last_segment);
+        assert_eq!(header.sdo_header.segment_data_size, 3);
+        assert_eq!(
+            &frame[SdoSegmented::RESPONSE_DATA_OFFSET..13],
+            &[0x92, 1, 2, 0]
+        );
+    }
+
+    #[test]
+    fn upload_collects_multiple_segments_without_header_or_padding() {
+        let first = [10, 0, 0, 0, 0, 0x13, 0, 0x30, 0, 1, 2, 3, 4, 5, 6, 7];
+        let last = [10, 0, 0, 0, 0, 0x23, 0, 0x30, 0x19, 8, 9, 10, 0, 0, 0, 0];
+        let mut result = [0; 10];
+        let mut total = 0;
+        for frame in [first, last] {
+            let headers = SdoSegmented::unpack_from_slice(&frame).unwrap();
+            append_upload_segment(
+                &mut result,
+                &mut total,
+                &headers,
+                &frame[SdoSegmented::RESPONSE_DATA_OFFSET..],
+            )
+            .unwrap();
+        }
+        assert_eq!(total, 10);
+        assert_eq!(result, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn emergency_during_sdo_is_queued_and_the_response_continues() {
+        let device = SubDevice::default();
+        let emergency = [10, 0, 0, 0, 0, 3, 0, 0x10, 0x10, 0x32, 4, 1, 2, 3, 4, 5];
+        let response = [
+            10, 0, 0, 0, 0, 0x13, 0, 0x30, 0x43, 0, 0x10, 0, 0x92, 1, 2, 0,
+        ];
+        assert!(!route_sdo_response(&device, &emergency).unwrap());
+        assert!(route_sdo_response(&device, &response).unwrap());
+        let queued = device.take_unsolicited_mailbox().unwrap();
+        assert_eq!(Emergency::from_mailbox(&queued).unwrap().error_code, 0x3210);
+        assert!(device.take_unsolicited_mailbox().is_none());
+    }
+
+    #[test]
+    fn unsolicited_queue_is_bounded_and_fifo() {
+        let device = SubDevice::default();
+        let mut emergency = [10, 0, 0, 0, 0, 3, 0, 0x10, 1, 0, 4, 1, 2, 3, 4, 5];
+        save_unsolicited(&device, &emergency).unwrap();
+        emergency[8] = 2;
+        save_unsolicited(&device, &emergency).unwrap();
+        emergency[8] = 3;
+        assert_eq!(
+            save_unsolicited(&device, &emergency),
+            Err(Error::Capacity(Item::UnsolicitedMailbox))
+        );
+        for code in [1, 2] {
+            let frame = device.take_unsolicited_mailbox().unwrap();
+            assert_eq!(Emergency::from_mailbox(&frame).unwrap().error_code, code);
+        }
+    }
+}
+
 pub struct Coe<'maindevice, S> {
     subdevice: &'maindevice SubDeviceRef<'maindevice, S>,
 }
@@ -43,6 +214,97 @@ where
 {
     pub fn new(subdevice: &'maindevice SubDeviceRef<'maindevice, S>) -> Self {
         Self { subdevice }
+    }
+
+    fn check_unsolicited_capacity(&self) -> Result<(), Error> {
+        if self.subdevice.unsolicited_mailboxes.read().is_full() {
+            return Err(Error::Capacity(Item::UnsolicitedMailbox));
+        }
+        Ok(())
+    }
+
+    // Reading the first eight bytes does not acknowledge an ESC mailbox; reading
+    // through its last byte does. Only large mailboxes need this extra check.
+    async fn check_message_size(&self, mailbox: &Mailbox, allow_sdo: bool) -> Result<(), Error> {
+        if usize::from(mailbox.len) <= crate::subdevice::MAX_UNSOLICITED_MAILBOX_LEN {
+            return Ok(());
+        }
+        let header = self
+            .subdevice
+            .read(mailbox.address)
+            .receive_slice(self.subdevice.maindevice, 8)
+            .await?;
+        let length = usize::from(u16::from_le_bytes([header[0], header[1]])) + 6;
+        let sdo = header[5] & 0x0f == 3 && header[7] >> 4 == 3;
+        if length > crate::subdevice::MAX_UNSOLICITED_MAILBOX_LEN && !(allow_sdo && sdo) {
+            return Err(Error::Capacity(Item::UnsolicitedMailbox));
+        }
+        Ok(())
+    }
+
+    /// Save a waiting message without sending a request. Returns whether one was read.
+    pub(crate) async fn poll_unsolicited(&self) -> Result<bool, Error> {
+        let mailbox = self
+            .subdevice
+            .config
+            .mailbox
+            .read
+            .ok_or(Error::Mailbox(MailboxError::NoWriteMailbox))?;
+        let status = self
+            .subdevice
+            .read(RegisterAddress::sync_manager_status(mailbox.sync_manager))
+            .receive::<crate::sync_manager_channel::Status>(self.subdevice.maindevice)
+            .await?;
+        if !status.mailbox_full {
+            return Ok(false);
+        }
+        self.check_unsolicited_capacity()?;
+        self.check_message_size(&mailbox, false).await?;
+        let response = self
+            .subdevice
+            .read(mailbox.address)
+            .receive_slice(self.subdevice.maindevice, mailbox.len)
+            .await?;
+        save_unsolicited(self.subdevice, &response)?;
+        Ok(true)
+    }
+
+    pub(crate) async fn read_pending_into(
+        &self,
+        output: &mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        let mailbox = self
+            .subdevice
+            .config
+            .mailbox
+            .read
+            .ok_or(Error::Mailbox(MailboxError::NoWriteMailbox))?;
+        let status = self
+            .subdevice
+            .read(RegisterAddress::sync_manager_status(mailbox.sync_manager))
+            .receive::<crate::sync_manager_channel::Status>(self.subdevice.maindevice)
+            .await?;
+        if !status.mailbox_full {
+            return Ok(None);
+        }
+        // Inspect the header without acknowledging the mailbox, so an undersized
+        // destination leaves the message available for a subsequent attempt.
+        let header = self
+            .subdevice
+            .read(mailbox.address)
+            .receive_slice(self.subdevice.maindevice, 6)
+            .await?;
+        let length = usize::from(u16::from_le_bytes([header[0], header[1]])) + 6;
+        if length > output.len() || length > usize::from(mailbox.len) {
+            return Err(Error::Capacity(Item::UnsolicitedMailbox));
+        }
+        let response = self
+            .subdevice
+            .read(mailbox.address)
+            .receive_slice(self.subdevice.maindevice, mailbox.len)
+            .await?;
+        output[..length].copy_from_slice(&response[..length]);
+        Ok(Some(length))
     }
 
     /// Get CoE read/write mailboxes, waiting for them to be ready to read/write.
@@ -65,8 +327,7 @@ where
         let mailbox_write_sm_status =
             RegisterAddress::sync_manager_status(write_mailbox.sync_manager);
 
-        // Ensure SubDevice OUT (master IN) mailbox is empty. We'll retry this multiple times in
-        // case the SubDevice is still busy or bugged or something.
+        // Preserve messages already waiting before starting a new request.
         for i in 0..10 {
             let sm_status = self
                 .subdevice
@@ -74,19 +335,22 @@ where
                 .receive::<crate::sync_manager_channel::Status>(self.subdevice.maindevice)
                 .await?;
 
-            // If flag is set, read entire mailbox to clear it
             if sm_status.mailbox_full {
                 fmt::debug!(
-                    "SubDevice {:#06x} OUT mailbox not empty (status {:?}). Clearing.",
+                    "SubDevice {:#06x} OUT mailbox not empty (status {:?}). Saving.",
                     self.subdevice.configured_address(),
                     sm_status
                 );
 
-                self.subdevice
+                self.check_unsolicited_capacity()?;
+                self.check_message_size(&read_mailbox, false).await?;
+                let response = self
+                    .subdevice
                     .read(read_mailbox.address)
                     .ignore_wkc()
                     .receive_slice(self.subdevice.maindevice, read_mailbox.len)
                     .await?;
+                save_unsolicited(self.subdevice, &response)?;
             } else {
                 break;
             }
@@ -134,6 +398,7 @@ where
     async fn wait_for_mailbox_response(
         &self,
         read_mailbox: &Mailbox,
+        check_unsolicited: bool,
     ) -> Result<ReceivedPdu, Error> {
         let mailbox_read_sm = RegisterAddress::sync_manager_status(read_mailbox.sync_manager);
 
@@ -162,6 +427,10 @@ where
                 e
             );
         })?;
+
+        if check_unsolicited {
+            self.check_message_size(read_mailbox, true).await?;
+        }
 
         // Read acknowledgement from SubDevice OUT mailbox
         let response = self
@@ -200,7 +469,19 @@ where
             .send(self.subdevice.maindevice, &request.pack().as_ref())
             .await?;
 
-        let mut response = self.wait_for_mailbox_response(&read_mailbox).await?;
+        // The response deadline covers all interleaved unsolicited messages, not each
+        // individual mailbox read.
+        let mut response = async {
+            loop {
+                self.check_unsolicited_capacity()?;
+                let response = self.wait_for_mailbox_response(&read_mailbox, true).await?;
+                if route_sdo_response(self.subdevice, &response)? {
+                    break Ok(response);
+                }
+            }
+        }
+        .timeout(self.subdevice.maindevice.timeouts.mailbox_response())
+        .await?;
 
         /// A super generalised version of the various header shapes for responses, extracting only
         /// what we need in this method.
@@ -228,44 +509,7 @@ where
 
         let headers = HeadersRaw::unpack_from_slice(&response)?;
 
-        assert_ne!(headers.coe_header.service, CoeService::Emergency);
-
-        if headers.coe_header.service == CoeService::Emergency {
-            #[derive(Debug, Copy, Clone, ethercrab_wire::EtherCrabWireRead)]
-            #[wire(bytes = 8)]
-            struct EmergencyData {
-                #[wire(bytes = 2)]
-                error_code: u16,
-                #[wire(bytes = 1)]
-                error_register: u8,
-                #[wire(bytes = 5)]
-                extra_data: [u8; 5],
-            }
-
-            response.trim_front(HeadersRaw::PACKED_LEN);
-
-            let decoded = EmergencyData::unpack_from_slice(&response)?;
-
-            #[cfg(not(feature = "defmt"))]
-            fmt::error!(
-                "Mailbox emergency code {:#06x}, register {:#04x}, data {:#04x?}",
-                decoded.error_code,
-                decoded.error_register,
-                decoded.extra_data
-            );
-            #[cfg(feature = "defmt")]
-            fmt::error!(
-                "Mailbox emergency code {:#06x}, register {:#04x}, data {=[u8]}",
-                decoded.error_code,
-                decoded.error_register,
-                decoded.extra_data
-            );
-
-            Err(Error::Mailbox(MailboxError::Emergency {
-                error_code: decoded.error_code,
-                error_register: decoded.error_register,
-            }))
-        } else if headers.command == CoeCommand::Abort {
+        if headers.command == CoeCommand::Abort {
             // ETG 1000.6 §5.6.2.7.1 Table 40
             response.trim_front(HeadersRaw::PACKED_LEN);
             let code = CoeAbortCode::unpack_from_slice(&response)?;
@@ -302,7 +546,7 @@ where
         } else {
             let headers = R::unpack_from_slice(&response)?;
 
-            response.trim_front(HeadersRaw::PACKED_LEN);
+            response.trim_front(R::RESPONSE_DATA_OFFSET);
 
             Ok((headers, response))
         }
@@ -342,7 +586,7 @@ where
         // CiA 301 §7.4.1).
         let mut buf = heapless::Vec::<u8, 0x1fffe>::new();
         loop {
-            let mut response = self.wait_for_mailbox_response(&read_mailbox).await?;
+            let mut response = self.wait_for_mailbox_response(&read_mailbox, false).await?;
             let headers = ObjectDescriptionListResponse::unpack_from_slice(&response)?;
             if headers.sdo_info_header.op_code == SdoInfoOpCode::GetObjectDescriptionListResponse {
                 let length = headers.mailbox.length as usize - COE_HEADER_AND_LIST_TYPE_SIZE;
@@ -614,24 +858,7 @@ where
 
                     let (headers, data) = self.mailbox_write_read(request).await?;
 
-                    // The spec defines the data length as n-3, so we'll just go with that magic
-                    // number...
-                    let mut chunk_len = usize::from(headers.header.length - 3);
-
-                    // Special case as per spec: Minimum response size is 7 bytes. For smaller
-                    // responses, we must remove the number of unused bytes at the end of the
-                    // response. Extremely weird.
-                    if chunk_len == 7 {
-                        chunk_len -= usize::from(headers.sdo_header.segment_data_size);
-                    }
-
-                    let data = data.get(0..chunk_len).ok_or(Error::Internal)?;
-
-                    buf.get_mut(total_len..(total_len + chunk_len))
-                        .ok_or(Error::Internal)?
-                        .copy_from_slice(data);
-
-                    total_len += chunk_len;
+                    append_upload_segment(buf, &mut total_len, &headers, &data)?;
 
                     if headers.sdo_header.is_last_segment {
                         break;
